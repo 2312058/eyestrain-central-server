@@ -24,10 +24,10 @@ machine — no raw video/images), timestamps.
 
 import os
 from datetime import datetime
+from urllib.parse import urlparse
 
 from flask import Flask, request, jsonify
-import psycopg2
-import psycopg2.extras
+import pg8000.dbapi as pg8000
 
 app = Flask(__name__)
 
@@ -35,32 +35,63 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 API_KEY      = os.environ.get("EYESTRAIN_API_KEY", "")
 
 
+def _parse_database_url(url: str) -> dict:
+    """
+    pg8000 takes connection parameters directly rather than a single DSN
+    string (unlike psycopg2), so we parse Render's postgres:// URL here.
+    """
+    parsed = urlparse(url)
+    return {
+        "host":     parsed.hostname,
+        "port":     parsed.port or 5432,
+        "database": parsed.path.lstrip("/"),
+        "user":     parsed.username,
+        "password": parsed.password,
+    }
+
+
 def get_conn():
+    """
+    CHANGED — was psycopg2.connect(). psycopg2-binary's compiled C
+    extension failed to load on Render's Python 3.14 runtime (no
+    prebuilt wheel available yet for this very new Python version, and
+    the source-built fallback didn't load at runtime). pg8000 is a pure
+    Python driver — no compiled extension, so this class of problem
+    can't happen regardless of Python version.
+    """
     if not DATABASE_URL:
         raise RuntimeError(
             "DATABASE_URL environment variable is not set. "
             "Set it in Render's dashboard under Environment."
         )
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    params = _parse_database_url(DATABASE_URL)
+    return pg8000.connect(
+        host=params["host"],
+        port=params["port"],
+        database=params["database"],
+        user=params["user"],
+        password=params["password"],
+    )
 
 
 def init_db():
     """Creates the sessions table if it doesn't already exist."""
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS session_uploads (
-                    id                SERIAL PRIMARY KEY,
-                    username          TEXT NOT NULL,
-                    filename          TEXT NOT NULL,
-                    csv_content       TEXT NOT NULL,
-                    consent_timestamp TEXT,
-                    received_at       TIMESTAMP NOT NULL DEFAULT NOW(),
-                    UNIQUE (username, filename)
-                );
-            """)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS session_uploads (
+                id                SERIAL PRIMARY KEY,
+                username          TEXT NOT NULL,
+                filename          TEXT NOT NULL,
+                csv_content       TEXT NOT NULL,
+                consent_timestamp TEXT,
+                received_at       TIMESTAMP NOT NULL DEFAULT NOW(),
+                UNIQUE (username, filename)
+            );
+        """)
         conn.commit()
+        cur.close()
     finally:
         conn.close()
 
@@ -120,16 +151,17 @@ def upload():
 
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO session_uploads
-                    (username, filename, csv_content, consent_timestamp)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (username, filename) DO NOTHING
-                RETURNING id;
-            """, (username, filename, csv_content, consent_ts))
-            row = cur.fetchone()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO session_uploads
+                (username, filename, csv_content, consent_timestamp)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (username, filename) DO NOTHING
+            RETURNING id;
+        """, (username, filename, csv_content, consent_ts))
+        row = cur.fetchone()
         conn.commit()
+        cur.close()
     finally:
         conn.close()
 
@@ -148,18 +180,19 @@ def summary():
 
     conn = get_conn()
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT username, COUNT(*) AS file_count
-                FROM session_uploads
-                GROUP BY username
-                ORDER BY username;
-            """)
-            rows = cur.fetchall()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT username, COUNT(*) AS file_count
+            FROM session_uploads
+            GROUP BY username
+            ORDER BY username;
+        """)
+        rows = cur.fetchall()
+        cur.close()
     finally:
         conn.close()
 
-    users = {r["username"]: r["file_count"] for r in rows}
+    users = {r[0]: r[1] for r in rows}
     return jsonify({"users": users, "total_files": sum(users.values())})
 
 
@@ -175,21 +208,27 @@ def export_user(username):
 
     conn = get_conn()
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("""
-                SELECT filename, csv_content, received_at
-                FROM session_uploads
-                WHERE username = %s
-                ORDER BY received_at;
-            """, (username,))
-            rows = cur.fetchall()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT filename, csv_content, received_at
+            FROM session_uploads
+            WHERE username = %s
+            ORDER BY received_at;
+        """, (username,))
+        rows = cur.fetchall()
+        cur.close()
     finally:
         conn.close()
 
-    for r in rows:
-        r["received_at"] = r["received_at"].isoformat()
-
-    return jsonify({"username": username, "files": rows})
+    files = [
+        {
+            "filename":    r[0],
+            "csv_content": r[1],
+            "received_at": r[2].isoformat() if r[2] else None,
+        }
+        for r in rows
+    ]
+    return jsonify({"username": username, "files": files})
 
 
 # Initialize the table on startup (safe to call repeatedly — CREATE TABLE
